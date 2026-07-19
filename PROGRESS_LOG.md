@@ -1,0 +1,327 @@
+# Progress Log — Agent Budget Controller Build
+
+Companion to `IMPLEMENTATION_PLAN.md`. This file is append-only; each phase gets its own entry logged after that phase finishes (or when work stops partway through).
+
+Phase 0 (AWS account) and Phase 2 (OpenAI key) were completed by the user before this log started.
+
+---
+
+## Phase 1 — Install Software On Your Computer
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:05 local
+- **Files created or modified:** None
+- **Checks run:**
+  - `node -v` → `v22.17.1` — OK
+  - `npm -v` → `10.9.2` — OK
+  - `python --version` → `Python 3.10.0` — present (plan calls for 3.12, but local Python is only used to run the CDK CLI and for `py_compile` syntax checks; Lambda runtime is pinned to `PYTHON_3_12` in the CDK stack regardless of local version, so this is not a blocker)
+  - `pip --version` → `pip 25.0.1` — OK
+  - `aws --version` → `aws-cli/2.34.19` — already installed
+  - `cdk --version` → not found → **installed via `npm install -g aws-cdk`** → now `2.1129.0` — OK
+  - `python3 --version` → fails (Windows Store alias, not a real interpreter). Noted as a deviation: `cdk.json`'s `"app": "python3 app.py"` will need to read `"python app.py"` instead on this machine. Will apply this fix when writing `cdk.json` in Phase 5.
+  - `aws sts get-caller-identity` → initially `InvalidClientTokenId` (no credentials configured)
+- **Result:** Completed. Node/npm/Python/pip/AWS CLI already present; CDK CLI installed successfully (`2.1129.0`). User created IAM user `budget-controller-deployer` with `AdministratorAccess` in the AWS Console, created an access key, and ran `aws configure` themselves. Verified via `aws sts get-caller-identity`:
+  ```
+  {
+      "UserId": "AIDA25CEFWWNGD5KHX6TQ",
+      "Account": "749614773658",
+      "Arn": "arn:aws:iam::749614773658:user/budget-controller-deployer"
+  }
+  ```
+- **Errors hit / resolution:** CDK CLI missing → resolved by `npm install -g aws-cdk`. `python3` alias not resolving on Windows (Microsoft Store shim) → will use `python` instead of `python3` in `cdk.json`'s app command in Phase 5. AWS credentials initially invalid → resolved by user creating IAM user + access key and running `aws configure` in their own terminal.
+
+---
+
+## Phase 3 — Bootstrap AWS For CDK
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:29 local
+- **Files created or modified:** None (creates AWS-side resources only)
+- **Test Case command run:** `cdk bootstrap aws://749614773658/us-east-1`
+- **Actual output (tail):**
+  ```
+  CDKToolkit | 12/12 | 8:30:13 pm | CREATE_COMPLETE | AWS::CloudFormation::Stack | CDKToolkit
+  ✅  Environment aws://749614773658/us-east-1 bootstrapped.
+  ```
+- **Additional verification:** `aws cloudformation describe-stacks --stack-name CDKToolkit --query "Stacks[0].StackStatus"` → `CREATE_COMPLETE`
+- **Result:** PASS
+- **Errors hit:** None.
+
+---
+
+## Phase 4 — Create the Project Folder
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:35 local
+- **Files created or modified:**
+  - `.venv/` (Python virtual environment)
+  - `.git/`, `.gitignore` (created automatically by `cdk init`)
+  - `app.py`, `cdk.json`, `requirements.txt`, `requirements-dev.txt`, `README.md`, `source.bat` (CDK scaffold defaults, to be overwritten with plan content in Phase 5)
+  - `budget_controller/` (package dir with default stack file, to be overwritten in Phase 5)
+  - `tests/` (default unit test scaffold from `cdk init`)
+- **Test Case command run:** `cdk synth`
+- **Actual output:** Exit code `0`. Emitted a full valid CloudFormation YAML template (135 lines: `CDKMetadata` resource, region-availability `Conditions`, `BootstrapVersion` parameter). A Node.js stack trace (`ENOTEMPTY: directory not empty, rmdir ... jsii-kernel .../aws-cdk-lib`) printed above the YAML but did not affect the exit code or output — this is a known harmless jsii temp-directory cleanup race, not a synth failure.
+- **Result:** PASS
+- **Errors hit / resolution:**
+  1. `cdk init app --language python` refused to run because the directory wasn't empty (`PROGRESS_LOG.md` was already present). Resolved by moving `PROGRESS_LOG.md` aside temporarily, running `cdk init`, then moving it back — no plan files were touched.
+  2. First `cdk synth` failed with `ModuleNotFoundError: No module named 'aws_cdk'` because `cdk.json`'s `"app"` command invoked the system `python`, not the project's `.venv` where `aws-cdk-lib` was installed. Fixed by changing `cdk.json`'s `app` entry to `.venv\\Scripts\\python.exe app.py` (explicit venv interpreter path, Windows backslashes — forward slashes were rejected by `cmd.exe` with "not recognized as an internal or external command"). This mirrors the `python3`→`python` deviation already noted in Phase 1, applied here as well.
+
+---
+
+## Phase 5 — Write the CDK Stack
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:42 local
+- **Files created or modified:**
+  - `requirements.txt` — left as generated by `cdk init` (`aws-cdk-lib>=2.260.0,<3.0.0`, `constructs>=10.5.0,<11.0.0`); already satisfies the plan's stated minimums (`>=2.150.0` / `>=10.0.0`), so not downgraded.
+  - `cdk.json` — left as generated (already has the Windows-safe `app`/`watch` entries from Phase 4; the plan's version is a stripped-down illustrative example, and overwriting would have discarded the CDK CLI's modern feature-flag defaults for no benefit).
+  - `app.py` — replaced with plan's minimal content (instantiate `BudgetControllerStack`, call `app.synth()`).
+  - `budget_controller/budget_controller_stack.py` — replaced with the full stack definition from the plan: DynamoDB table (`BudgetControllerTable`, PK/SK, pay-per-request, `RemovalPolicy.DESTROY`), EventBridge bus (`budget-governance`) + rule + SNS topic with email subscription to `harshithav00024@gmail.com`, `MeteringFunction`, `ProxyFunction`, `HealthFunction` Lambdas (Python 3.12 runtime), API Gateway (`v1` stage) with `POST /chat/completions` and `GET /health`, and the `CfnOutput(self, "ApiUrl", value=api.url)` addition.
+  - `lambda/proxy/`, `lambda/metering/`, `lambda/health/`, `lambda/dashboard/` — created as empty directories (each with a placeholder `.gitkeep`) so `_lambda.Code.from_asset(...)` has a valid path to synth against before the actual handler code is written in Phases 6–9.
+- **Test Case command run:** `cdk synth`
+- **Actual output:** Exit code `0`. Full CloudFormation template synthesized with no Python traceback, including `BudgetControllerTableCC523229`, `MeteringFunction07548963`, `ProxyFunction99E5E7D2`, `HealthFunctionServiceRole...`, and their IAM roles/policies — confirmed via `grep` for expected logical IDs in the output.
+- **Result:** PASS
+- **Errors hit:** None — synth succeeded on the first attempt with the empty lambda asset directories in place.
+
+---
+
+## Phase 6 — Write the Metering Lambda
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:45 local
+- **Files created or modified:** `lambda/metering/lambda_metering.py` (created, exact plan content); removed placeholder `lambda/metering/.gitkeep`.
+- **Test Case command run:** `.venv/Scripts/python.exe -m py_compile lambda/metering/lambda_metering.py` (used the venv's Python 3.10 interpreter rather than bare `python`, consistent with the interpreter-path fix from Phase 4/5 — `py_compile` only checks syntax, so the Lambda's actual Python 3.12 runtime target is unaffected)
+- **Actual output:** No output, exit code `0`.
+- **Result:** PASS
+- **Errors hit:** None.
+
+---
+
+## Phase 7 — Write the Proxy Lambda
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:47 local
+- **Files created or modified:** `lambda/proxy/lambda_proxy.py` (created, exact plan content); removed placeholder `lambda/proxy/.gitkeep`.
+- **Test Case command run:** `.venv/Scripts/python.exe -m py_compile lambda/proxy/lambda_proxy.py`
+- **Actual output:** No output, exit code `0`.
+- **Result:** PASS
+- **Errors hit:** None. (Note: `OPENAI_API_KEY` is read via `os.environ[...]` at module import time, but `py_compile` only parses/compiles the file — it does not execute the module — so the missing env var locally did not cause a failure here. This will be supplied at deploy time via `cdk deploy -c openai_api_key=...` in Phase 10.)
+
+---
+
+## Phase 8 — Write the Health Check Lambda
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:49 local
+- **Files created or modified:** `lambda/health/lambda_health.py` (created, exact plan content); removed placeholder `lambda/health/.gitkeep`.
+- **Test Case command run:** `.venv/Scripts/python.exe -m py_compile lambda/health/lambda_health.py`
+- **Actual output:** No output, exit code `0`.
+- **Result:** PASS
+- **Errors hit:** None.
+
+---
+
+## Phase 9 — Build the Live Dashboard
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 20:53 local
+- **Files created or modified:**
+  - `lambda/dashboard/lambda_dashboard.py` (created, exact plan content — serves HTML at `GET /dashboard` and live JSON at `GET /dashboard/data`); removed placeholder `lambda/dashboard/.gitkeep`.
+  - `budget_controller/budget_controller_stack.py` — added the `DashboardFunction` Lambda + `dashboard`/`dashboard/data` API Gateway resources + `CfnOutput(self, "DashboardUrl", ...)`, inserted right after the health resource wiring and before the existing `ApiUrl` output, per the plan.
+- **Test Case command run:** `.venv/Scripts/python.exe -m py_compile lambda/dashboard/lambda_dashboard.py`
+- **Actual output:** No output, exit code `0`.
+- **Result:** PASS
+- **Additional verification (not required by the plan's boxed test case, but done proactively since Phase 10's real deploy is next):** Re-ran `cdk synth` — exit code `0`, and `DashboardFunction`, `DashboardFunctionServiceRole`, `DashboardFunctionServiceRoleDefaultPolicy`, and `DashboardFunctionLogGroup` all present in the synthesized template with no errors or traceback.
+- **Errors hit:** None. Full dashboard-in-browser verification is deferred to Phase 10's test case, as the plan specifies, since it requires a live deployed API URL.
+
+---
+
+## Phase 10 — Deploy Everything to AWS
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 21:05 local
+- **Files created or modified:** None locally (deploys the existing stack to AWS). Real AWS resources created: CloudFormation stack `BudgetControllerStack`, DynamoDB table `BudgetControllerTable`, Lambdas `ProxyFunction`/`MeteringFunction`/`HealthFunction`/`DashboardFunction`, API Gateway `budget-controller-api` (stage `v1`), EventBridge bus `budget-governance` + rule, SNS topic with email subscription.
+- **Deploy command:** Run by the user themselves in their own terminal (not through the assistant), per the "never handle the OpenAI key" constraint: `cdk deploy -c openai_api_key="sk-...".` User confirmed the IAM changeset prompt with `y`.
+- **User-reported deploy output:**
+  ```
+  BudgetControllerStack.ApiUrl = https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/
+  BudgetControllerStack.BudgetControllerApiEndpoint0E9ED6FC = https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/
+  BudgetControllerStack.DashboardUrl = https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/dashboard
+  ```
+- **Independent verification performed by the assistant (none of these require the OpenAI key):**
+  - `aws cloudformation describe-stacks --stack-name BudgetControllerStack --query "Stacks[0].StackStatus"` → `CREATE_COMPLETE`
+  - `aws dynamodb describe-table --table-name BudgetControllerTable --query "Table.TableStatus"` → `ACTIVE`
+  - `aws lambda list-functions` filtered to the stack → all 4 functions present: `ProxyFunction`, `DashboardFunction`, `MeteringFunction`, `HealthFunction`
+  - `curl https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/health` → `{"status": "healthy", "dynamodb": true}`, HTTP `200`
+  - `curl https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/dashboard` → HTTP `200` (HTML page loads)
+  - `curl https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/dashboard/data` → `{"rows": []}`, HTTP `200` (empty because no agents/teams are registered yet — expected until Phase 11)
+- **Result:** PASS — all boxed Test Case checks from the plan confirmed (CloudFormation `CREATE_COMPLETE`, DynamoDB table exists, 4 Lambdas exist, `/health` returns 200 healthy), plus the dashboard's live HTML/JSON endpoints verified as a bonus check.
+- **Errors hit:** None reported.
+- **Live API URL for reference (not sensitive):** `https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/`
+
+---
+
+## Phase 11 — Onboard Your First Team and Agent
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 21:10 local
+- **Files created or modified:** `register.py` (created, exact plan content — registers `demo-team`, `agent-1`, and issues an API key).
+- **Test Case command run:** `.venv/Scripts/python.exe register.py`
+- **Actual output:** `Your API key (save this securely): sk-budget-[REDACTED]`
+- **Additional verification:** `aws dynamodb scan --table-name BudgetControllerTable --query "Items[].PK.S"` → three items present: `APIKEY#sk-budget-[REDACTED]`, `AGENT#agent-1`, `TEAM#demo-team`.
+- **Result:** PASS
+- **Errors hit / resolution:** `register.py` failed with `ModuleNotFoundError: No module named 'boto3'` on first run — `boto3` is provided automatically inside the real Lambda runtime but isn't part of the local CDK venv. Resolved by `pip install boto3` into `.venv` (needed for this and future local scripts that talk to DynamoDB directly, e.g. Phase 12's tests reference DynamoDB state checks manually — the test script itself only uses `urllib`, no local boto3 dependency there).
+- **Note:** The demo API key (`sk-budget-...`) is a budget-controller-internal test credential, not an OpenAI key or AWS credential, so it is not subject to the "never print" constraint — the plan's own test case requires it to be printed and reused in Phase 12.
+
+---
+
+## Phase 12 — Run the Official Success Criteria Tests
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 21:15–21:45 local
+- **Files created or modified:** `test_success_criteria.py` (created, exact plan content). Two real bugs found and fixed in `lambda/metering/lambda_metering.py` and `register.py` (details below) — both required a redeploy (`cdk deploy`, run by the user, confirmed each time).
+
+### Bugs found during integration testing (not caught by earlier phases' `py_compile` syntax checks, since both are runtime/type errors)
+
+1. **`TypeError: Float types are not supported. Use Decimal types instead.`** — boto3's DynamoDB `Table` resource (high-level API) rejects native Python `float` values; only `int`/`Decimal` are accepted. The plan's exact `lambda_metering.py` passed the OpenAI cost (always a `float`, e.g. `3e-06`) straight into `ExpressionAttributeValues`. This silently failed on **every** metering invocation from the very first real OpenAI call onward (the proxy invokes metering asynchronously — `InvocationType="Event"` — so the caller never saw the failure; `/health` and the proxy's own 200 responses looked fine while spend was never actually recorded). Confirmed via CloudWatch Logs on `MeteringFunction`. Fixed by converting `cost = Decimal(str(event["cost"]))` in `lambda_metering.py`, and by adding a `_dec()` helper in `register.py` to convert any float limits (e.g. the plan's own suggested `limit_session=0.05`) to `Decimal` before `put_item`.
+2. **`ValidationException: Value provided in ExpressionAttributeValues unused in expressions: keys: {:zero}`** — surfaced only after fixing bug #1. The `:zero` placeholder was included in `ExpressionAttributeValues` unconditionally, but is only referenced by the `if_not_exists(spend_hour, :zero)` branch of the expression, taken when `same_hour` is `True`. On every fresh agent (or new hour), `same_hour` is `False`, so the plain `spend_hour = :c` branch is used instead — which never references `:zero` — and DynamoDB rejects the whole `UpdateItem` call because an unused expression value was supplied. Since the update never succeeds, `hour_bucket` never gets persisted, so `same_hour` is `False` again on every subsequent call too — this failed on **100% of calls**, not just the first. Fixed by only including `:zero` in `ExpressionAttributeValues` when `same_hour` is `True`.
+- Both fixes required `cdk deploy -c openai_api_key="..."` to push the corrected Lambda code live — run by the user in their own terminal each time, per the OpenAI-key handling constraint. Two redeploys total during this phase, both confirmed `UPDATE_COMPLETE` via `aws cloudformation describe-stacks`, with `/health` re-verified healthy after each.
+- **Note on Git Bash / AWS CLI:** `aws logs` commands with a `/aws/lambda/...`-style argument initially failed with a bogus `InvalidParameterException` regex error — this is MSYS/Git-Bash's automatic POSIX-path-to-Windows-path conversion mangling the leading `/`. Worked around with `MSYS_NO_PATHCONV=1` prefixed to the `aws` command.
+
+### Test Case execution
+
+The plan's own `test_success_criteria.py`, run as one continuous script against a single shared agent/team record, cannot cleanly exercise all 6 checks in one pass: the MVP's metering design (`PERIOD#current`, no rollover — the plan's own documented simplification) means `spend_month`, `spend_session`, and `spend_hour` all accumulate on the *same* record with no per-session scoping and no reset. Once one threshold trips (e.g. month limit exhausted), every subsequent call in the same run is blocked before it can exercise the next criterion. Additionally, the bonus runaway detector (pauses the agent once hourly spend crosses 20% of its *monthly* limit) will, by definition, always trip before or at the same time as a 100%-of-monthly-limit block if driven via the agent's own limit — 20% < 100% — so the criteria-2/3 "hard block" and the bonus "runaway pause" can't both be cleanly demonstrated via the agent's limit in a single rapid-fire test run.
+
+To get real, unambiguous evidence for all 6 checks, each criterion was driven with `register.py`'s own functions (`register_team`/`register_agent`/`issue_api_key`) re-invoked with tiny, criterion-specific limits (tuned using the real observed per-call cost, ~`3e-06`/call for `gpt-4o-mini` on "Say OK") via a temporary local driver script (`_phase12_driver.py`, deleted after use — not a plan deliverable). Criteria 2/3 specifically were driven via the **team's** `limit_month` (not the agent's), since the team has no runaway/pause logic, cleanly isolating "warning at 80%" / "hard block at 100%" from the bonus behavior.
+
+**Actual output (final run, after both fixes):**
+```
+CRITERION 1: Concurrent tracking (3 simultaneous calls)
+  spend_month before: 0
+  [PASS] concurrent-1: HTTP 200 - estimated_cost 7e-06
+  [PASS] concurrent-2: HTTP 200 - estimated_cost 7e-06
+  [PASS] concurrent-0: HTTP 200 - estimated_cost 3e-06
+  spend_month after: 0.000017
+  [PASS] all 3 calls reflected, no lost updates
+
+CRITERIA 2/3: Warning at 80%, hard block at 100% (via team limit)
+  [PASS] call-1-establishes-spend: HTTP 200
+  [PASS] call-2-should-show-warning-true: HTTP 200 - warning: true
+  [PASS] call-3-over-limit-should-be-429: HTTP 429 - "budget_exhausted"
+
+CRITERION 4: Session budget close
+  [PASS] session-call-1: HTTP 200
+  [PASS] session-call-2-should-402: HTTP 402 - "session_budget_exhausted"
+
+CRITERION 5: Model substitution
+  [PASS] model-substitution-check: HTTP 200 - model_substituted: true, model_used: gpt-4o-mini
+
+BONUS: Runaway detector
+  [PASS] runaway-trigger-call: HTTP 200
+  agent status after runaway-trigger-call: PAUSED
+  [PASS] agent paused as expected: True
+  [PASS] post-pause-call-should-403: HTTP 403 - "agent_paused_human_review_required"
+```
+- **Result:** PASS — all 5 official success criteria + the bonus runaway detector confirmed working end-to-end against the live deployed API, each with real HTTP status codes and DynamoDB state checks as evidence.
+- **Official `test_success_criteria.py` script:** also run once, as literally specified by the plan, against the default generous demo limits (`limit_month=10`, `limit_session=2`) restored via a fresh `register.py` run. As expected given those generous limits, its `over-limit-call` and `session-call-2-should-402` assertions showed `[FAIL]` (still `HTTP 200`, since a couple of sub-cent calls can't realistically cross a $10/$2 limit) — this is expected and matches the plan's own warning box ("use small limits while testing... to trigger warnings/blocks after just a few calls"); it does not indicate a bug. The isolated driver run above is the authoritative evidence that the underlying logic for every criterion is correct.
+- **Final state left for Phase 13:** `register.py` re-run once more at the end to reset `demo-team`/`agent-1` back to default generous limits and `ACTIVE` status (undoing the Bonus test's pause), issuing a fresh API key, so the agent is in a normal, unpaused state going into Phase 13.
+
+---
+
+## Phase 13 — Confirm Email Alerts Work
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-03 21:50–22:05 local
+- **Files created or modified:** None (AWS-side subscription confirmation + live alert trigger only).
+- **Test Case steps performed:**
+  1. Checked SNS subscription status: `aws sns list-subscriptions` → `SubscriptionArn: PendingConfirmation` (the original confirmation email from Phase 10's first deploy was never actioned).
+  2. User could not find the original confirmation email (checked inbox, not in the obvious place). Resent it via `aws sns subscribe --topic-arn ... --protocol email --notification-endpoint harshithav00024@gmail.com` (harmless — re-sends the same confirmation email, no billing/resource impact).
+  3. User found and clicked "Confirm subscription" on the resent email. Re-checked: `aws sns list-subscriptions` → `SubscriptionArn` now a real ARN (`...BudgetAlertsTopic...:eeefc7c3-2b20-4c1c-8c36-1a2397d52074`), confirming the subscription is active.
+  4. Triggered a real alert: re-registered `demo-team` with a tiny `limit_month=0.0000036` (team-level, same isolation technique as Phase 12) and fired 3 calls. Results: call 1 → HTTP 200 (`warning: false`, establishes spend), call 2 → HTTP 200 (`warning: true` — crossed 80% team threshold), call 3 → HTTP 429 `budget_exhausted` (crossed 100%). Metering Lambda logs showed no errors for these invocations (confirming the Phase 12 bug fixes hold under real alert-triggering conditions).
+  5. Verified the underlying `budget.warning`/`budget.exhausted` EventBridge events actually reached SNS via `aws cloudwatch get-metric-statistics` on `AWS/SNS NumberOfMessagesPublished` for the `BudgetAlertsTopic`: 2 new messages published in the relevant 1-minute window, matching the 2 expected alert events (one warning, one exhausted) from calls 1 and 2.
+  6. User confirmed via inbox check that 2 alert emails arrived, referencing budget-governance with `agent_id`/`team_id` in the body.
+- **Result:** PASS — subscription confirmed, real alerts triggered end-to-end, emails received and verified by the user.
+- **Errors hit / resolution:** Original subscription confirmation email was never actioned (not a bug — just needed the user to check email, which wasn't done until prompted). Resolved by resending via `aws sns subscribe` and having the user click through the resent email.
+- **Cleanup:** `register.py` re-run once more at the end to reset `demo-team`/`agent-1` back to default generous limits (`limit_month=50`/`10`, `limit_session=2`) and `ACTIVE` status, issuing a fresh API key, leaving the system in a normal, unpaused, non-alerting state.
+
+---
+
+## Build Complete
+
+All phases from Phase 3 through Phase 13 are done. Per the plan's Go-Live Checklist (Section 16): the stack is deployed on real AWS (not localhost), handles concurrent requests with state persisted in DynamoDB, has CloudWatch logging + a working `/health` endpoint, connects to the real OpenAI API, all 5 success criteria + the bonus runaway detector pass, the live dashboard is reachable at `https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/dashboard`, and budget alert emails are confirmed working. Two real bugs (float/Decimal DynamoDB type mismatch; unused `:zero` expression value) were found during Phase 12 integration testing and fixed — see that phase's entry for full detail. The stack has NOT been torn down (`cdk destroy` not run), per the plan's guidance to keep it live until evaluation/review is complete.
+
+---
+
+## Section 16 — Go-Live Checklist (explicit run)
+
+- **Timestamp:** 2026-07-03 22:10 local
+- **Result: all 7 criteria PASS**, re-verified live at the time of this run:
+
+| # | Criterion | Result | Evidence |
+|---|---|---|---|
+| 1 | Deployed on AWS, not localhost | PASS | `aws cloudformation describe-stacks --stack-name BudgetControllerStack` → `UPDATE_COMPLETE` |
+| 2 | Handles concurrent requests, persists state, usable API | PASS | Phase 12's 3-concurrent-call test (no lost updates); re-confirmed here with a fresh call → `aws dynamodb get-item` on `AGENT#agent-1` shows `spend_month: 0.000007` persisted |
+| 3 | Logging, error handling, health check | PASS | `aws logs describe-log-groups --log-group-name-prefix /aws/lambda/BudgetControllerStack` → 4 log groups (Dashboard/Health/Metering/Proxy Functions); `curl .../health` → `{"status": "healthy", "dynamodb": true}` HTTP 200 |
+| 4 | Connects to a real LLM provider | PASS | Live call with prompt "Reply with exactly: GOLIVE-CHECK-OK" returned real OpenAI completion content `"GOLIVE-CHECK-OK"` |
+| 5 | All 5 success criteria pass | PASS | Confirmed in Phase 12 |
+| 6 | Bonus runaway detector works | PASS | Confirmed in Phase 12 |
+| 7 | Budget dashboard shows live spend vs. limit | PASS | `curl .../dashboard/data` → `{"rows": [{"id": "agent-1", "type": "agent", "spend": 0.0, "limit": 10.0, ...}, {"id": "demo-team", ...}]}` HTTP 200, real per-agent/team rows |
+
+- **Errors hit:** None.
+
+---
+
+## Dashboard Redesign — Production-Grade, Team/Agent/Session Insight
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-04 (post go-live)
+- **Trigger:** User request to make the dashboard "more detailed... team wise spend, agent wise spend, session wise spend... production grade."
+- **Files created or modified:**
+  - `lambda/metering/lambda_metering.py` — added a new per-session DynamoDB record (`PK=AGENT#{agent_id}`, `SK=SESSION#{session_id}`) updated on every metering call with `spend_total`, `call_count`, `first_seen_ts`/`last_active_ts`, `team_id`, `last_model`. This is a pure additional observability write — it does **not** change budget enforcement, which still checks the agent's existing cumulative `spend_session` field in `lambda_proxy.py` (left untouched, per the plan's existing tested semantics).
+  - `lambda/dashboard/lambda_dashboard.py` — full rewrite. `get_data()` now does one table scan, buckets items into teams/agents/sessions, computes a 4-tier status per agent (`healthy` / `warning` / `exhausted` / `paused` — the last two both map from the plan's existing `status`/`limit` fields, no new state introduced), and returns a hierarchical JSON: `{summary, teams: [{..., agents: [{..., sessions: [...]}]}]}`. The HTML page was redesigned per the `dataviz` skill: summary stat tiles (total spend, teams, agents, warning count, paused+exhausted count), per-team cards with a spend meter, an agent table with a status badge (icon + label, never color alone, per the skill's status-palette rule) and per-model spend chips, and click-to-expand rows showing each agent's individual sessions (spend, call count, last model, last active). Uses the skill's validated status palette (`good #0ca30c` / `warning #fab219` / `serious #ec835a` / `critical #d03b3b`) and light/dark-aware CSS custom properties from `references/palette.md`.
+- **Design validation:** Ran `scripts/validate_palette.js` on the categorical palette (not directly used here, but validated the method) — all checks passed with a documented light-mode contrast WARN on 3 hues, mitigated by the skill's own relief rule (visible labels always present, never color-alone), which the badge design already satisfies.
+- **Test Case commands run:**
+  1. `.venv/Scripts/python.exe -m py_compile lambda/metering/lambda_metering.py lambda/dashboard/lambda_dashboard.py` → exit `0`.
+  2. `cdk synth` → exit `0`, no CDK/IAM changes needed (Query is already covered by the existing `grant_read_data`/`grant_read_write_data` grants from Phase 5).
+  3. **Local dry-run before redeploying:** imported `lambda_dashboard.get_data()` directly against the live table (read-only, no deploy needed to test the aggregation logic) — confirmed correct output: 6 teams, 12 agents, correct status tiers, e.g. `cleaning-agent` and `summarization-agent` both correctly showed `"paused"` (their tiny agent-level limits also cross the 20%-hourly runaway threshold almost immediately — the same interaction documented in Phase 12, not a new bug).
+  4. **After redeploy** (user ran `cdk deploy -c openai_api_key="..."`, confirmed `UPDATE_COMPLETE`): re-verified `/health` still healthy; fired 3 real calls against `ingestion-agent` across 2 different `x-session-id` values; confirmed via `/dashboard/data` that session records now populate correctly — `demo-session-1` showed `calls: 2`, `demo-session-2` showed `calls: 1`, each with correct per-session spend and `last_model`; confirmed the HTML page itself returns HTTP 200 and renders the new markup.
+- **Result:** PASS — team-wise, agent-wise, and now genuine session-wise spend are all visible on the dashboard, with production-style summary stats and status coding.
+- **Errors hit:** None.
+- **Known limitation carried over:** Sessions recorded *before* this change (all activity prior to this redeploy) have no session-level history, since that data simply didn't exist yet — only calls made after this point populate the sessions list. This is expected, not a bug.
+
+---
+
+## Dashboard v2 — Graphs & Expanded KPIs Per Agent/Team/Session
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-04 (post dashboard v1)
+- **Trigger:** User request for "graphs and more KPIs for each agent, team, and session... the best dashboard in the industry."
+- **Design process:** Consulted the `dataviz` skill's remaining reference files (`choosing-a-form.md`, `marks-and-anatomy.md`, `interaction.md`, `anti-patterns.md`) before building, since this phase adds real interactive charts (not just meters/tables). Key decisions driven by the skill: single-series time trend → line chart, sequential blue (magnitude, not identity, so no categorical hues); hover crosshair + tooltip + table-view toggle on the headline chart (tooltips enhance, never gate — every value also in the table twin); session comparison → thin horizontal bars, single hue, only rendered when an agent has >1 session (never a one-bar bar chart); status badges keep icon+label pairing (status color never carries meaning alone).
+- **Files created or modified:**
+  - `lambda/metering/lambda_metering.py` — added a new append-only hourly log item (`PK=AGENT#{agent_id}`, `SK=HOUR#{yyyy-mm-dd-HH}`, `ADD spend :c`). Distinct from the existing `spend_hour`/`hour_bucket` fields (which are overwritten every new hour for the runaway-pause check, left untouched) — this new item is never overwritten, giving real per-hour history for charting.
+  - `lambda/dashboard/lambda_dashboard.py` — full rewrite of `get_data()`: per-agent `table.query()` (`Key("PK").eq(...) & Key("SK").between(...)`) reconstructs the last 24 hourly buckets (`hour_series_labels()` fills gaps with 0), rolled up into agent/team/org-wide `trend` arrays. New computed KPIs per agent: `remaining_budget`, `burn_rate_day` (= sum of last 24h spend), `days_left` (remaining/burn_rate), `total_calls` + `avg_cost_per_call` (from session records), `spend_hour` vs `runaway_threshold` (this-hour spend vs the 20%-of-monthly-limit pause trigger, so the runaway feature's proximity is now visible before it fires), `last_active_ts`. Per-team: `total_calls`, `avg_cost_per_call`, `trend`. Org-wide: same rollup into `summary.trend` and `summary.avg_cost_per_call`.
+  - HTML/JS: new org-wide interactive 24h trend chart (hand-rolled inline SVG, no external chart library — consistent with the rest of this MVP's dependency-free approach) with a `pointermove`-driven crosshair + tooltip and a "View as table" toggle exposing the raw 24-row hour/spend table (the accessibility twin, per the skill's Tier-0 requirement). Per-team and per-agent 24h sparklines (`sparklineSvg()`, plain `<svg><path>`). Per-agent KPI strip (6 tiles: remaining budget, burn rate/day, days-left-at-rate, total calls, this-hour-vs-threshold, last-active). Per-session comparison bar chart (thin `<div>` bars, single hue, direct end-labels) shown only when an agent has more than one session.
+- **Test Case commands run:**
+  1. `.venv/Scripts/python.exe -m py_compile lambda/metering/lambda_metering.py lambda/dashboard/lambda_dashboard.py` → exit `0`.
+  2. Extracted the embedded `<script>` block and ran `node --check` on it → exit `0`, no JS syntax errors.
+  3. `cdk synth` → exit `0`.
+  4. **Local dry-run before redeploying:** imported `lambda_dashboard.get_data()` directly against the live table — confirmed correct shape and values (24 hour labels, all-zero trends as expected since the hourly-log feature wasn't live yet, correct `remaining_budget`/`runaway_threshold`/`avg_cost_per_call` computed from existing data).
+  5. **After redeploy** (user ran `cdk deploy`, confirmed `UPDATE_COMPLETE`, `/health` re-verified): fired 3 real calls against `ingestion-agent`, then confirmed via `/dashboard/data` that the current hour's bucket now shows real spend (`1.2e-05`) at both the agent and rolled-up team level, `burn_rate_day`/`days_left` compute correctly (`68.3` days at current rate), and `spend_hour`/`runaway_threshold` are both present and correctly typed. Confirmed the HTML page returns HTTP 200 and contains the new markup (`grep` for `orgChart`, `kpi-strip`, `renderTrendChart`, `sparklineSvg`, `session-bar-row` all found in the served page).
+- **Result:** PASS — the dashboard now has a real interactive time-series chart, per-team/agent trend sparklines, and a substantially expanded KPI set at every level (org/team/agent/session), while budget enforcement logic is completely untouched.
+- **Errors hit:** One tooling snag, not a code bug: initial attempts to write a temp file to `/tmp/...` for the Node syntax check failed silently/oddly under Git Bash + Windows Python (MSYS path mangling, same class of issue as the earlier `aws logs` case) — resolved by writing the temp JS file directly into the project directory instead and deleting it afterward.
+- **Known limitation:** Hourly trend history only exists from this deploy forward — there's no backfill for spend that happened before the `HOUR#` log existed, so early in a fresh agent's life the sparkline/chart will show mostly zeros until enough hours of real activity accumulate.
+
+---
+
+## Real Integration — data-cleaning-platform, and Test-Data Cleanup
+
+- **Status:** Completed
+- **Timestamp:** 2026-07-04 (post dashboard v2)
+- **Context:** User connected a real, separately-developed project (an "Agentic Data Cleaning Platform" — LangGraph/LangChain, 6 specialized agent roles: Schema Analyzer, Data Profiler, Anomaly Detector, Cleaner, Validator, Confidence Scorer) to this Budget Controller, routing its LLM calls through the proxy. This is the first genuine external system integration, as opposed to synthetic test agents.
+- **Registration:** Team `data-cleaning-platform` ($5/month cap) + one budget-controller agent per role ($1/month, $0.50/session each), via `register.py`'s functions (ad hoc, not saved as a new project file). Issued 6 API keys, one per role, and gave the user a self-contained integration prompt (for a fresh session on their own project) describing: env vars to add, the `ChatOpenAI` `base_url`/`api_key`/`default_headers` wiring pattern, the no-streaming and chat-completions-only caveats, and a recommended small-CSV first test.
+- **Confirmed working:** User's real project successfully called through the proxy — dashboard showed live spend on `cleaner` (2 calls, `gpt-4o`) and `schema-analyzer` (2 calls, `gpt-4o-mini`), correctly split by model, all agents `Healthy`.
+- **Cleanup:** User requested removing all prior synthetic/demo teams and agents, keeping only `data-cleaning-platform` since it's the one real working integration. Before deleting, ran a dry-run preview (`table.scan()` + Python set-difference against a keep-list of `TEAM#data-cleaning-platform` and its 6 `AGENT#` partition keys) to enumerate exactly what would be removed, shown to the user before executing. Deleted via `table.batch_writer()`: 6 teams (`demo-team`, `my-team`, `data-ops`, `analytics`, `customer-support`, `enterprise-reference`), 12 agents and all their `SESSION#`/`HOUR#` sub-items, and 37 orphaned `APIKEY#` items — 59 items total. Verified afterward via a full table scan: exactly 18 items remain (`data-cleaning-platform`'s team record, its 6 agents, their existing sessions/hourly logs, and their 6 API keys) and `/dashboard/data` now shows exactly one team.
+- **Result:** PASS — table now contains only the real integration; no test/demo data left over.
+- **Errors hit:** None.
+
+---
