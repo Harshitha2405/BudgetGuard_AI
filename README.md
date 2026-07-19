@@ -4,6 +4,15 @@ A serverless cost-governance layer that sits in front of the OpenAI API so auton
 
 Built entirely on AWS with the CDK (Python), deployed as real infrastructure — not a local mock.
 
+## Live Demo
+
+The stack is deployed and running on AWS right now:
+
+- **Dashboard:** https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/dashboard
+- **Health check:** https://834dz6r99f.execute-api.us-east-1.amazonaws.com/v1/health
+
+Both are read-only and require no API key. `POST /chat/completions` does require a budget-scoped API key (issued via `register.py`), which is intentionally not published here.
+
 ## Why
 
 LLM-calling agents can loop, retry, or misbehave in ways that burn through API budgets in minutes. This project puts a policy-enforcement proxy between agents and the LLM provider, so spend limits are enforced server-side, not left to the agent's own good behavior.
